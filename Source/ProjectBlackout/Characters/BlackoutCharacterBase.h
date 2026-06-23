@@ -1,0 +1,127 @@
+// ─── 구현 내역 ───────────────────────
+//  - 김민영: 캐릭터 최상위 베이스 — ASC 접근 인터페이스 + 데미지 GE Spec 적용 경로 + 다운/완전사망 상태 및 복제 브리지
+//  - 허혁: 피격 리액션(데미지·에임·방향 분기) 및 스턴 게이지/피격 단계 공통 훅
+//  - 최승현: 사망 처리 경로의 매치 통계(처치) 집계 연동
+// ──────────────────────────────────────
+
+#pragma once
+
+#include "CoreMinimal.h"
+#include "GameFramework/Character.h"
+#include "AbilitySystemInterface.h"
+#include "GameplayTagContainer.h"
+#include "Interfaces/BlackoutDamageable.h"
+#include "BlackoutCharacterBase.generated.h"
+
+class UBlackoutAbilitySystemComponent;
+class ABlackoutCharacterBase;
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FBlackoutDownedStateChangedSignature, bool, bIsDowned);
+DECLARE_MULTICAST_DELEGATE_TwoParams(FBlackoutDownedStateChangedNativeSignature, ABlackoutCharacterBase*, bool);
+
+/**
+ * 모든 캐릭터(플레이어/적/보스)의 최상위 베이스 클래스.
+ * ASC 접근 인터페이스를 일관되게 제공하고, 공통 반응 함수(사망/피격/기절)를 선언.
+ *
+ * - 플레이어: ABlackoutPlayerState가 ASC를 소유 → PossessedBy에서 포인터 캐시
+ * - 적/보스:  자기 자신이 ASC를 소유 → 생성자에서 포인터 캐시
+ */
+UCLASS(Abstract)
+class PROJECTBLACKOUT_API ABlackoutCharacterBase : public ACharacter, public IAbilitySystemInterface, public IBlackoutDamageable
+{
+	GENERATED_BODY()
+
+public:
+	ABlackoutCharacterBase(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
+
+	virtual UAbilitySystemComponent* GetAbilitySystemComponent() const override;
+	virtual FGameplayTag GetHitPartTag(FName BoneName) const override;
+	virtual void ReceiveDamageFromHitbox(const FGameplayEffectSpecHandle& SpecHandle, FName BoneName) override;
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+	
+	bool IsDead() const { return bIsDead; }
+	bool IsDowned() const;
+
+	UPROPERTY(BlueprintAssignable, Category = "Blackout|State")
+	FBlackoutDownedStateChangedSignature OnDownedStateChanged;
+
+	FBlackoutDownedStateChangedNativeSignature OnDownedStateChangedNative;
+
+protected:
+	virtual void BeginPlay() override;
+
+	/** 공용 죽음 상태 중복죽음 또는 죽음 후 추가 입력등을 막기용 */
+	UPROPERTY(ReplicatedUsing = OnRep_DeadStateTagBridge)
+	bool bIsDead = false;
+
+	/** State.Downed 태그가 로컬 연출에 반영된 마지막 상태입니다. 게임플레이 판정의 원천으로 사용하지 않습니다. */
+	UPROPERTY(Transient)
+	bool bCachedIsDowned = false;
+
+	/** 서버의 State.Downed 태그를 클라이언트 로컬 ASC 태그로 옮기기 위한 복제 브리지입니다. */
+	UPROPERTY(ReplicatedUsing = OnRep_DownedStateTagBridge)
+	bool bReplicatedDownedStateTag = false;
+	
+	/** 공통 데미지 GE Spec 적용 경로. 무적 태그와 피격 반응도 여기서 함께 처리합니다. */
+	bool ApplyIncomingDamageSpec(const FGameplayEffectSpecHandle& SpecHandle, FName BoneName);
+
+	/** 서브클래스에서 초기화 후 설정. 직접 소유하지 않으므로 UPROPERTY로 참조만 유지. */
+	UPROPERTY()
+	TObjectPtr<UBlackoutAbilitySystemComponent> AbilitySystemComponent;
+
+	/** Health가 0이 됐을 때 AttributeSet → 캐릭터로 전달되는 사망 처리 진입점. */
+	virtual void OnDeath();
+
+	/** Health가 0이 되었을 때 다운 상태를 지원하는 캐릭터가 진입하는 공통 훅입니다. */
+	virtual void OnDowned();
+
+	/** HP 0 도달 시 즉시 사망 대신 다운 상태로 전환할 수 있는지 여부입니다. */
+	virtual bool CanEnterDownedState() const;
+
+	/** 피격 시 실제 적용된 데미지와 공격자 위치를 기준으로 히트 리액션 몽타주 재생 등 공통 처리를 수행합니다. */
+	virtual void OnHitReact(float AppliedDamage, const FVector& DamageSourceLocation);
+
+	/** 데미지/스턴 적용이 끝난 뒤 캐릭터별 반응 분기를 수행합니다. */
+	virtual void HandlePostDamageReaction(float AppliedDamage, float StunBefore, float StunAfter, const FVector& DamageSourceLocation);
+
+	/** 기절(State.Stun) 태그 부여 시 이동/액션 봉쇄 처리. */
+	virtual void OnStun();
+
+	/** 다운 상태 변경 시 서브클래스가 로컬 전용 후처리를 구현할 수 있는 훅입니다. */
+	virtual void HandleDownedStateChanged(bool bWasDowned, bool bIsDowned);
+
+	/** AbilitySystemComponent가 준비된 뒤 State.Downed 태그 변경을 연출 캐시에 연결합니다. */
+	void BindDownedStateTagEvent();
+
+	/** 서버 권한 경로에서 State.Downed 태그를 변경합니다. */
+	void SetDownedStateActive(bool bNewDowned);
+
+	/** 서버 권한 경로에서 State.Dead 태그를 변경합니다. */
+	void SetDeadStateActive(bool bNewDead);
+
+	/** 복제 브리지 값을 현재 로컬 ASC 태그 컨테이너에 반영합니다. */
+	void ApplyReplicatedDownedStateTag();
+
+	/** 복제된 완전 사망 상태를 현재 로컬 ASC 태그 컨테이너에 반영합니다. */
+	void ApplyReplicatedDeadStateTag();
+
+	/** 현재 State.Downed 태그 값을 연출 캐시에 반영합니다. */
+	void RefreshDownedPresentationCache();
+
+	/** State.Downed 태그 변경 이벤트 수신 지점입니다. */
+	void HandleDownedTagChanged(const FGameplayTag CallbackTag, int32 NewCount);
+
+	/** 연출 캐시를 갱신하고 상태 변경 delegate 및 후처리 훅을 호출합니다. */
+	void SetDownedPresentationCache(bool bNewDowned);
+
+	UFUNCTION()
+	void OnRep_DownedStateTagBridge();
+
+	UFUNCTION()
+	void OnRep_DeadStateTagBridge();
+
+	void BroadcastDownedStateChanged();
+
+	FDelegateHandle DownedTagChangedHandle;
+	TWeakObjectPtr<UAbilitySystemComponent> BoundDownedTagAbilitySystemComponent;
+};

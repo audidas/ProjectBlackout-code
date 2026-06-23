@@ -1,0 +1,221 @@
+#include "GAS/Abilities/Player/BlackoutGA_Sprint.h"
+
+#include "AbilitySystemComponent.h"
+#include "BlackoutAbilityActorInfoUtils.h"
+#include "Characters/BlackoutPlayerCharacter.h"
+#include "Characters/BlackoutPlayerMovementComponent.h"
+#include "Combat/Components/BlackoutCombatComponent.h"
+#include "Core/BlackoutLog.h"
+#include "Framework/BlackoutPlayerState.h"
+#include "GAS/BlackoutAbilitySystemComponent.h"
+#include "GameFramework/CharacterMovementComponent.h"
+#include "GameplayTags/BlackoutGameplayTags.h"
+#include "GAS/Attributes/BlackoutPlayerAttributeSet.h"
+#include "TimerManager.h"
+
+UBlackoutGA_Sprint::UBlackoutGA_Sprint()
+{
+	InputID = EBlackoutAbilityInputID::Sprint;
+	bReplicateInputDirectly = true;
+
+	ActivationOwnedTags.AddTag(BlackoutGameplayTags::State_Sprinting);
+	CancelAbilitiesWithTag.AddTag(BlackoutGameplayTags::Ability_Player_Aim);
+	ActivationBlockedTags.AddTag(BlackoutGameplayTags::State_Downed);
+	ActivationBlockedTags.AddTag(BlackoutGameplayTags::State_Locked);
+}
+
+void UBlackoutGA_Sprint::ActivateAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
+	const FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData)
+{
+	BO_LOG_GAS(Log, "GA_Sprint activate requested");
+
+	if (!ActorInfo || !ActorInfo->AvatarActor.IsValid())
+	{
+		BO_LOG_GAS(Warning, "GA_Sprint failed: ActorInfo 또는 AvatarActor가 유효하지 않음");
+		EndAbility(Handle, ActorInfo, ActivationInfo, true, true);
+		return;
+	}
+
+	UAbilitySystemComponent* AbilitySystemComponent = GetAbilitySystemComponentFromActorInfo();
+	if (!AbilitySystemComponent)
+	{
+		BO_LOG_GAS(Warning, "GA_Sprint failed: AbilitySystemComponent가 없음");
+		EndAbility(Handle, ActorInfo, ActivationInfo, true, true);
+		return;
+	}
+	const UBlackoutAbilitySystemComponent* BlackoutASC = Cast<UBlackoutAbilitySystemComponent>(AbilitySystemComponent);
+	const bool bHasInfiniteStaminaCheat = [&]()
+	{
+		if (const ABlackoutPlayerState* BlackoutPlayerState = BlackoutAbilityUtils::ResolveOwningBlackoutPlayerState(ActorInfo))
+		{
+			return BlackoutPlayerState->HasInfiniteStaminaCheat();
+		}
+
+		return false;
+	}();
+	const bool bSkipStaminaCheck = bHasInfiniteStaminaCheat || (BlackoutASC && BlackoutASC->ShouldSkipCostInShelter());
+	
+	const float CurrentStamina = AbilitySystemComponent->GetNumericAttribute(UBlackoutPlayerAttributeSet::GetStaminaAttribute());
+	if ((!bSkipStaminaCheck && CurrentStamina < MinActivationStamina ) || !CommitAbility(Handle, ActorInfo, ActivationInfo))
+	{
+		BO_LOG_GAS(Warning, "GA_Sprint failed: 스태미나 부족 또는 CommitAbility 실패 (CurrentStamina=%.2f)", CurrentStamina);
+		EndAbility(Handle, ActorInfo, ActivationInfo, true, true);
+		return;
+	}
+
+	BO_LOG_GAS(Log, "GA_Sprint activated: Character=%s", *GetNameSafe(ActorInfo->AvatarActor.Get()));
+
+	if (ABlackoutPlayerCharacter* PlayerCharacter = Cast<ABlackoutPlayerCharacter>(ActorInfo->AvatarActor.Get()))
+	{
+		PlayerCharacter->SetLocalSprintCameraActive(true);
+	}
+
+	if (UBlackoutCombatComponent* CombatComponent = ActorInfo->AvatarActor->FindComponentByClass<UBlackoutCombatComponent>())
+	{
+		CombatComponent->StopAim();
+	}
+
+	ApplySprintSpeed(ActorInfo);
+
+	if (UWorld* World = ActorInfo->AvatarActor->GetWorld())
+	{
+		World->GetTimerManager().SetTimer(SprintDrainTimerHandle, this, &UBlackoutGA_Sprint::HandleSprintTick, StaminaDrainInterval, true, StaminaDrainInterval);
+	}
+}
+
+void UBlackoutGA_Sprint::InputReleased(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
+	const FGameplayAbilityActivationInfo ActivationInfo)
+{
+	Super::InputReleased(Handle, ActorInfo, ActivationInfo);
+
+	if (IsActive())
+	{
+		BO_LOG_GAS(Log, "GA_Sprint input released");
+		EndAbility(Handle, ActorInfo, ActivationInfo, true, false);
+	}
+}
+
+void UBlackoutGA_Sprint::EndAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
+	const FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateEndAbility, bool bWasCancelled)
+{
+	BO_LOG_GAS(Log, "GA_Sprint ended: Cancelled=%s", bWasCancelled ? TEXT("true") : TEXT("false"));
+
+	if (ActorInfo && ActorInfo->AvatarActor.IsValid())
+	{
+		if (ABlackoutPlayerCharacter* PlayerCharacter = Cast<ABlackoutPlayerCharacter>(ActorInfo->AvatarActor.Get()))
+		{
+			PlayerCharacter->SetLocalSprintCameraActive(false);
+		}
+
+		if (UWorld* World = ActorInfo->AvatarActor->GetWorld())
+		{
+			World->GetTimerManager().ClearTimer(SprintDrainTimerHandle);
+		}
+
+		RestoreWalkSpeed(ActorInfo);
+	}
+
+	Super::EndAbility(Handle, ActorInfo, ActivationInfo, bReplicateEndAbility, bWasCancelled);
+}
+
+void UBlackoutGA_Sprint::HandleSprintTick()
+{
+	if (!IsActive())
+	{
+		BO_LOG_GAS(Log, "GA_Sprint finishing: 비활성 상태이거나 스태미나가 부족함");
+		K2_EndAbility();
+		return;
+	}
+
+	if (!ShouldDrainSprintStamina())
+	{
+		return;
+	}
+
+	if (!ConsumeSprintStamina())
+	{
+		BO_LOG_GAS(Log, "GA_Sprint finishing: 스태미나가 부족함");
+		K2_EndAbility();
+	}
+}
+
+bool UBlackoutGA_Sprint::ShouldDrainSprintStamina() const
+{
+	const ABlackoutPlayerCharacter* PlayerCharacter =
+		CurrentActorInfo ? Cast<ABlackoutPlayerCharacter>(CurrentActorInfo->AvatarActor.Get()) : nullptr;
+	const UBlackoutPlayerMovementComponent* MovementComponent =
+		PlayerCharacter ? Cast<UBlackoutPlayerMovementComponent>(PlayerCharacter->GetCharacterMovement()) : nullptr;
+	if (!MovementComponent)
+	{
+		return true;
+	}
+
+	const bool bHasMovementInput = MovementComponent->GetCurrentAcceleration().SizeSquared2D() > 1.0f;
+	const bool bIsActuallyMoving = MovementComponent->Velocity.SizeSquared2D() > 1.0f;
+	return bHasMovementInput || bIsActuallyMoving;
+}
+
+void UBlackoutGA_Sprint::ApplySprintSpeed(const FGameplayAbilityActorInfo* ActorInfo)
+{
+	const ABlackoutPlayerCharacter* PlayerCharacter = ActorInfo ? Cast<ABlackoutPlayerCharacter>(ActorInfo->AvatarActor.Get()) : nullptr;
+	UBlackoutPlayerMovementComponent* MovementComponent =
+		PlayerCharacter ? Cast<UBlackoutPlayerMovementComponent>(PlayerCharacter->GetCharacterMovement()) : nullptr;
+	if (!MovementComponent)
+	{
+		return;
+	}
+
+	// 어빌리티(GA_Sprint)에 설정된 스프린트 배율 값을 무브먼트 컴포넌트에 주입합니다.
+	MovementComponent->SetSprintSpeedMultiplier(SprintSpeedMultiplier);
+	MovementComponent->SetSprintRequested(true);
+}
+
+void UBlackoutGA_Sprint::RestoreWalkSpeed(const FGameplayAbilityActorInfo* ActorInfo) const
+{
+	const ABlackoutPlayerCharacter* PlayerCharacter = ActorInfo ? Cast<ABlackoutPlayerCharacter>(ActorInfo->AvatarActor.Get()) : nullptr;
+	if (UBlackoutPlayerMovementComponent* MovementComponent =
+		PlayerCharacter ? Cast<UBlackoutPlayerMovementComponent>(PlayerCharacter->GetCharacterMovement()) : nullptr)
+	{
+		MovementComponent->SetSprintRequested(false);
+	}
+}
+
+bool UBlackoutGA_Sprint::ConsumeSprintStamina() const
+{
+	UAbilitySystemComponent* AbilitySystemComponent = GetAbilitySystemComponentFromActorInfo();
+	if (!AbilitySystemComponent)
+	{
+		return false;
+	}
+
+	const UBlackoutAbilitySystemComponent* BlackoutAbilitySystemComponent = Cast<UBlackoutAbilitySystemComponent>(AbilitySystemComponent);
+	if (const ABlackoutPlayerState* BlackoutPlayerState = BlackoutAbilityUtils::ResolveOwningBlackoutPlayerState(CurrentActorInfo))
+	{
+		if (BlackoutPlayerState->HasInfiniteStaminaCheat())
+		{
+			return true;
+		}
+	}
+
+	if (BlackoutAbilitySystemComponent && BlackoutAbilitySystemComponent->ShouldSkipCostInShelter())
+	{
+		return true;
+	}
+	const float StaminaCostMultiplier = BlackoutAbilitySystemComponent ? BlackoutAbilitySystemComponent->GetStaminaCostMultiplier() : 1.0f;
+	const float ModifiedStaminaDrain = StaminaDrainPerTick * StaminaCostMultiplier;
+
+	const float CurrentStamina = AbilitySystemComponent->GetNumericAttribute(UBlackoutPlayerAttributeSet::GetStaminaAttribute());
+	if (CurrentStamina < ModifiedStaminaDrain)
+	{
+		return false;
+	}
+
+	AbilitySystemComponent->ApplyModToAttribute(UBlackoutPlayerAttributeSet::GetStaminaAttribute(), EGameplayModOp::Additive, -ModifiedStaminaDrain);
+
+	if (UBlackoutAbilitySystemComponent* MutableBlackoutAbilitySystemComponent = Cast<UBlackoutAbilitySystemComponent>(AbilitySystemComponent))
+	{
+		MutableBlackoutAbilitySystemComponent->NotifyStaminaSpent();
+	}
+
+	return true;
+}

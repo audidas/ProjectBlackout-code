@@ -1,0 +1,327 @@
+#include "BlackoutGameMode.h"
+
+#include "BlackoutAbilitySystemComponent.h"
+#include "BlackoutGameState.h"
+#include "BlackoutPlayerState.h"
+#include "BlackoutPlayerController.h"
+#include "BlackoutLog.h"
+#include "BOCharacterRoster.h"
+#include "Core/BlackoutTypes.h"
+#include "Kismet/GameplayStatics.h"
+#include "GameFramework/GameStateBase.h"
+#include "Engine/GameInstance.h"
+#include "BlackoutDedicatedSessionSubsystem.h"
+#include "BlackoutMatchFlowSubsystem.h"
+#include "BlackoutTelemetrySampler.h"
+
+namespace
+{
+	// 단일맵 런-페이즈 허용 전이표. 그 외 전이는 거부.
+	bool IsAllowedMatchTransition(EBlackoutMatchState From,
+	                              EBlackoutMatchState To)
+	{
+		switch (From)
+		{
+		// TransitionTo 호출처는 로비(HandleLobbyArrival)와 보스맵(StartBossCombat)뿐 —
+		// 둘 다 WaitingForPlayers 출발. 클리어/와이프/타이틀은 SetMatchState raw 라 전이표 비대상.
+		case EBlackoutMatchState::WaitingForPlayers:
+			return To == EBlackoutMatchState::ShelterPrep    // 로비 ShelterPrep
+				|| To == EBlackoutMatchState::MidBossCombat   // 보스맵 seamless 도착
+				|| To == EBlackoutMatchState::MainBossCombat; // 보스맵 seamless 도착
+		default:
+			return false;
+		}
+	}
+}
+
+ABlackoutGameMode::ABlackoutGameMode()
+{
+	GameStateClass = ABlackoutGameState::StaticClass();
+	PlayerStateClass = ABlackoutPlayerState::StaticClass();
+	PlayerControllerClass = ABlackoutPlayerController::StaticClass();
+
+	// Seamless Travel: 맵 이동 시 PlayerController/PlayerState 유지 (커넥션 끊김 없이 상태 이관).
+	bUseSeamlessTravel = true;
+}
+
+void ABlackoutGameMode::InitGame(const FString& MapName, const FString& Options,
+                                 FString& ErrorMessage)
+{
+	Super::InitGame(MapName, Options, ErrorMessage);
+
+	// 매칭 API(Nest.js)가 데디 실행 시 ?SessionId=<UUID> 형태로 넘겨주는 식별자를 보관한다.
+	MatchmakingSessionId = UGameplayStatics::ParseOption(
+		Options, TEXT("SessionId"));
+	BO_LOG_NET(Log, "InitGame: Map=%s SessionId=%s", *MapName,
+	           *MatchmakingSessionId);
+	
+	// 정원 
+	if (const UGameInstance* GI = GetGameInstance())
+	{
+		if (const UBlackoutMatchFlowSubsystem* MatchFlowSubsystem = GI->GetSubsystem<UBlackoutMatchFlowSubsystem>())
+		{
+			MaxPlayers= MatchFlowSubsystem->GetExpectedPlayers();
+		}
+	}
+}
+
+void ABlackoutGameMode::PreLogin(const FString& Options, const FString& Address,
+                                 const FUniqueNetIdRepl& UniqueId, FString& ErrorMessage)
+{
+	Super::PreLogin(Options, Address, UniqueId, ErrorMessage);
+
+	// 클라가 매칭으로 접속할 때 URL ?SessionId=... 옵션 캡처. 데디 라이프 내내 동일 SessionId 유지.
+	const FString IncomingSessionId = UGameplayStatics::ParseOption(Options, TEXT("SessionId"));
+	if (IncomingSessionId.IsEmpty() || MatchmakingSessionId == IncomingSessionId)
+	{
+		return;
+	}
+
+	MatchmakingSessionId = IncomingSessionId;
+	if (UGameInstance* GI = GetGameInstance())
+	{
+		if (UBlackoutDedicatedSessionSubsystem* Sess = GI->GetSubsystem<UBlackoutDedicatedSessionSubsystem>())
+		{
+			Sess->SetSessionId(IncomingSessionId);
+			BO_LOG_NET(Log, "PreLogin — SessionId 캡처: %s", *IncomingSessionId);
+		}
+	}
+}
+
+FString ABlackoutGameMode::InitNewPlayer(APlayerController* NewPlayerController,
+	const FUniqueNetIdRepl& UniqueId, const FString& Options,
+	const FString& Portal)
+{
+	FString ErrorMessage  =Super::InitNewPlayer(NewPlayerController, UniqueId, Options, Portal);
+	
+	// ?Acc=<로그인ID> 보관 - 재접속 시 프로세스 재실행해도 남아있음
+	if (ABlackoutPlayerState *PS = NewPlayerController ? NewPlayerController ->GetPlayerState<ABlackoutPlayerState>() : nullptr)
+	{
+		const FString Acc = UGameplayStatics::ParseOption(Options, TEXT("Acc"));
+		if (!Acc.IsEmpty())
+		{
+			PS->AccountId = Acc;
+			BO_LOG_NET(Log, "InitNewPlayer — Acc 보관: %s", *Acc);
+		}
+	}
+	return  ErrorMessage;
+}
+
+void ABlackoutGameMode::PostLogin(APlayerController* NewPlayer)
+{
+	Super::PostLogin(NewPlayer);
+	BO_LOG_NET(Log, "Player logged in: %s", *GetNameSafe(NewPlayer));
+
+	ConnectedPlayers.AddUnique(NewPlayer);
+	OnPlayerJoined(NewPlayer);
+}
+
+void ABlackoutGameMode::Logout(AController* Exiting)
+{
+	Super::Logout(Exiting);
+
+	if (APlayerController* PC = Cast<APlayerController>(Exiting))
+	{
+		ConnectedPlayers.Remove(PC);
+	}
+	BO_LOG_NET(Log, "Player logged out: %s (remaining=%d)",
+	           *GetNameSafe(Exiting), ConnectedPlayers.Num());
+
+	OnPlayerLeft(Exiting);
+	
+	// 전원 퇴장이면 grace 타이머 . 이미 도는중이면 중복 무시
+	if (ConnectedPlayers.Num() == 0 && !GetWorldTimerManager().IsTimerActive(EmptyServerGraceHandle))
+	{
+		GetWorldTimerManager().SetTimer(EmptyServerGraceHandle,this ,&ABlackoutGameMode::ConfirmEmptyServer, EmptyServerGracePeriod, false);
+	}
+}
+
+void ABlackoutGameMode::HandleSeamlessTravelPlayer(AController*& C)
+{
+	Super::HandleSeamlessTravelPlayer(C);
+	
+	if (APlayerController* PC =Cast<APlayerController>(C))
+	{
+		ConnectedPlayers.AddUnique(PC);
+		OnSeamlessArrival(PC);
+	}
+}
+
+void ABlackoutGameMode::HandlePartyWipe()
+{
+	BO_LOG_CORE(Log, "HandlePartyWipe triggered");
+}
+
+void ABlackoutGameMode::RespawnPlayerWithSelectedClass(
+	APlayerController* InController)
+{
+	if (!InController)
+	{
+		return;
+	}
+
+	const ABlackoutGameState* GS = GetGameState<ABlackoutGameState>();
+	const UBOCharacterRoster* CharacterRoster = GS
+		                                            ? GS->CharacterRoster
+		                                            : nullptr;
+
+	if (!CharacterRoster)
+	{
+		return;
+	}
+
+	ABlackoutPlayerState* PS = InController->GetPlayerState<
+		ABlackoutPlayerState>();
+	if (!PS || !PS->SelectedClassTag.IsValid())
+	{
+		return;
+	}
+
+	TSubclassOf<APawn> NewClass = CharacterRoster->FindPawnClassByTag(
+		PS->SelectedClassTag);
+	if (!NewClass)
+	{
+		return;
+	}
+
+	FTransform SpawnTransform = FTransform::Identity;
+	if (APawn* OldPawn = InController->GetPawn())
+	{
+		SpawnTransform = OldPawn->GetActorTransform();
+		if (UBlackoutAbilitySystemComponent* BlackoutASC = PS->
+			GetBlackoutAbilitySystemComponent())
+		{
+			BlackoutASC->ClearAllAbilities();
+		}
+		InController->UnPossess();
+		OldPawn->Destroy();
+	}
+
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.Owner = InController;
+	SpawnParams.SpawnCollisionHandlingOverride =
+		ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+	APawn* NewPawn = GetWorld()->SpawnActor<APawn>(
+		NewClass, SpawnTransform, SpawnParams);
+
+	if (!NewPawn)
+	{
+		return;
+	}
+	InController->Possess(NewPawn);
+	BO_LOG_NET(Log, "캐릭터 교체: %s -> %s",
+	           *InController->GetName(), *GetNameSafe(NewClass.Get()));
+}
+
+// Ready 집계 기본 구현. 정원 미달이거나 한 명이라도 bIsReady == false 면 false.
+bool ABlackoutGameMode::AllPlayersReady() const
+{
+	if (ConnectedPlayers.Num() < MaxPlayers) { return false; }
+	if (!GameState) { return false; }
+
+	for (APlayerState* PS : GameState->PlayerArray)
+	{
+		const ABlackoutPlayerState* BlackoutPS = Cast<ABlackoutPlayerState>(PS);
+		if (!BlackoutPS || !BlackoutPS->bIsReady) { return false; }
+	}
+	return true;
+}
+
+bool ABlackoutGameMode::AllPlayersLoaded() const
+{
+	if (ConnectedPlayers.Num() < MaxPlayers)
+	{
+		return false;
+	}
+	if (!GameState)
+	{
+		return false;
+	}
+	for (APlayerState* PS : GameState->PlayerArray)
+	{
+		const ABlackoutPlayerState* BlackoutPS = Cast<ABlackoutPlayerState>(PS);
+		if (!BlackoutPS || !BlackoutPS->IsLoaded())
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+// Ready 상태 갱신 직후 호출. 성립 시 자식 GameMode 훅 실행.
+void ABlackoutGameMode::NotifyReadyChanged()
+{
+	if (AllPlayersReady())
+	{
+		OnAllPlayersReady();
+	}
+}
+
+void ABlackoutGameMode::ConfirmEmptyServer()
+{
+	// grace 동안 접속이 들어와 1명이라도 있으면 Idle 복귀 취소
+	if (ConnectedPlayers.Num() >0)
+	{
+		BO_LOG_NET(Log, "EmptyServer grace 취소 — 접속 %d명 복귀", ConnectedPlayers.Num());
+		return;
+	}
+	
+	
+	BO_LOG_NET(Log, "EmptyServer 확정 — idle 복귀 트리거");
+	// 런 중 로비 포함 모든 모드에서 RunId 정리
+	if (UBlackoutTelemetrySampler* Sampler = GetGameInstance()
+		? GetGameInstance()->GetSubsystem<UBlackoutTelemetrySampler>() : nullptr)
+	{
+		Sampler->EndRun();
+	}
+	HandleEmptyServerReset();
+}
+
+// 매치 상태 전이 단일 권위. SetMatchState 직접 호출을 이 진입점으로 일원화한다.
+void ABlackoutGameMode::TransitionTo(EBlackoutMatchState NewState)
+{
+	ABlackoutGameState* GS = GetGameState<ABlackoutGameState>();
+	if (!GS)
+	{
+		return;
+	}
+
+	const EBlackoutMatchState Current = GS->CurrentMatchState;
+	if (Current == NewState)
+	{
+		return;
+	}
+	if (!IsAllowedMatchTransition(Current, NewState))
+	{
+		BO_LOG_NET(Warning, "거부된 매치 전이: %s -> %s",
+		           *UEnum::GetValueAsString(Current),
+		           *UEnum::GetValueAsString(NewState));
+		return;
+	}
+
+	GS->SetMatchState(NewState); // 복제 + 전이 로그는 SetMatchState 가 처리
+
+	// 쉘터 진입 시 Ready 를 새로 시작한다 (비석 상호작용으로 다시 커밋).
+	if (NewState == EBlackoutMatchState::ShelterPrep)
+	{
+		for (APlayerState* PS : GS->PlayerArray)
+		{
+			if (ABlackoutPlayerState* BPS = Cast<ABlackoutPlayerState>(PS))
+			{
+				BPS->SetReadyState(false);
+			}
+		}
+	}
+}
+
+void ABlackoutGameMode::BroadcastScreenFadeOut(FLinearColor FadeColor, bool bHoldUntilReady)
+{
+	
+	for (const TObjectPtr<APlayerController>& PC : ConnectedPlayers)
+	{
+		if (ABlackoutPlayerController* BlackoutPlayerController = Cast<ABlackoutPlayerController>(PC))
+		{
+			BlackoutPlayerController->Client_StartScreenFadeOut(FadeColor , bHoldUntilReady);
+		}
+	}
+}
