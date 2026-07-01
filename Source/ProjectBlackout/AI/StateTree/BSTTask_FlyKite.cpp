@@ -19,7 +19,7 @@ EStateTreeRunStatus FBSTTask_FlyKite::EnterState(
 	Data.NextReverseTime = Now + FMath::RandRange(Data.ReverseIntervalMin, Data.ReverseIntervalMax);
 	Data.CurrentHeightOffset = FMath::RandRange(Data.HeightMin, Data.HeightMax);
 
-	// 선회 각을 현재 보스->타겟 방향으로 초기화 (목표점이 제자리에서 시작 -> 튐 방지)
+	// 선회 각도를 현재 보스->타겟 방향으로 초기화
 	const APawn* Pawn = Data.Controller ? Data.Controller->GetPawn() : nullptr;
 	if (Pawn && Data.Target)
 	{
@@ -40,7 +40,7 @@ EStateTreeRunStatus FBSTTask_FlyKite::Tick(FStateTreeExecutionContext& Context, 
 		return EStateTreeRunStatus::Running; // 호버 대기
 	}
 
-	// 이동 잠금 태그(텔레포트 등 이동 독점 능력) 동안엔 이동 억제 — 능력이 목적지를 끌어당기지 않게
+	
 	if (UAbilitySystemComponent* ASC = UAbilitySystemGlobals::GetAbilitySystemComponentFromActor(Pawn))
 	{
 		if (ASC->HasMatchingGameplayTag(BlackoutGameplayTags::State_MovementLocked))
@@ -51,7 +51,7 @@ EStateTreeRunStatus FBSTTask_FlyKite::Tick(FStateTreeExecutionContext& Context, 
 
 	const float Now = World->GetTimeSeconds();
 
-	// 선회 방향 반전 (+ 목표 고도 재추첨 → 높이 변주)
+	// 선회 방향 반전
 	if (Now >= Data.NextReverseTime)
 	{
 		Data.bOrbitRight = !Data.bOrbitRight;
@@ -59,21 +59,21 @@ EStateTreeRunStatus FBSTTask_FlyKite::Tick(FStateTreeExecutionContext& Context, 
 		Data.CurrentHeightOffset = FMath::RandRange(Data.HeightMin, Data.HeightMax);
 	}
 
-	// 선회 각 진행
+	// 선회 각도 진행
 	const float Dir = Data.bOrbitRight ? 1.0f : -1.0f;
 	Data.OrbitAngle += Dir * FMath::DegreesToRadians(Data.OrbitAngularSpeed) * DeltaTime;
 
 	// 가변 반경
 	const float Radius = Data.DesireRange + Data.RadiusVarAmplitude * FMath::Sin(Now * Data.RadiusVarFrequency);
 
-	// 목표점 = 타겟 주위 궤도점(수평) + 고도/부유(수직)
+	// 목표점 = 타겟 주위 궤도회전 + 부유 
 	const FVector TargetLoc = Data.Target->GetActorLocation();
 	FVector Desired = TargetLoc;
 	Desired.X += FMath::Cos(Data.OrbitAngle) * Radius;
 	Desired.Y += FMath::Sin(Data.OrbitAngle) * Radius;
 	Desired.Z = TargetLoc.Z + Data.CurrentHeightOffset + Data.BobAmplitude * FMath::Sin(Now * Data.BobFrequency);
 
-	// 단일 방향 스티어링 (반경/선회/고도가 목표점에 인코딩 -> 합산 희석 없음)
+	// 단일 방향 스티어링 (반경/선회/고도가 하나로)
 	const FVector ToDesired = Desired - Pawn->GetActorLocation();
 	Pawn->AddMovementInput(ToDesired.GetSafeNormal());
 
