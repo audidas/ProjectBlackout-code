@@ -184,7 +184,7 @@ void ABlackoutPlayerCharacter::UpdateCameraCollision(float DeltaSeconds)
 		const float ForwardDist = FVector::DotProduct(
 			Hit.Location - PivotLocation, -CameraDir);
 		const float TotalDist = FVector::Dist(Hit.Location, PivotLocation);
-		// 후방 성분이 충분할 때(=진짜 뒤쪽 벽)만 당김. 측면 위주 막힘(어깨 옆 벽)은 무시 → 캐릭터 안 사라짐. Type B는 후속.
+		// 뒤쪽 벽일 때만 팔을 당긴다. 옆벽은 무시 → 측면에서 캐릭터가 안 가려짐. 측면 막힘은 아래에서 따로 처리.
 		if (ForwardDist > TotalDist * 0.5f)
 		{
 			TargetLength = FMath::Max(ForwardDist - CameraCollisionBuffer,
